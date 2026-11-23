@@ -63,13 +63,13 @@ jobs:
             Included:
             - `Flux/server` Script and `Flux/client` LocalScript with `Core`, `Classes`, and `Handlers` children
             - server-side validation, authorization helpers, rate limits, payload limits, and violation reporting
-            - rolling network keys, replay protection, and separate event and function channels
-            - packages and the module loader, independently implemented for v0.3.0
+            - rolling session seeds, counter-based replay rejection, and separate event and function channels
+            - packages and the module loader, independently implemented for v0.3.x
             - source layout for Rojo in the repository
 
-            Flux Next v0.3.0 replaces the earlier package implementations. Releases before v0.3.0 were removed from this repository; see `THIRD_PARTY_NOTICES.md`.
+            Flux Next ${{ github.ref_name }} replaces the earlier package implementations. Releases before v0.3.0 were removed from this repository; see `THIRD_PARTY_NOTICES.md`.
 
-            The token layer is protocol hygiene, not an anti-cheat boundary. Keep gameplay decisions on the server. See `SECURITY.md` and the README for the threat model and API.
+            The checksum layer is protocol hygiene, not authentication or an anti-cheat boundary. Keep gameplay decisions on the server. See `SECURITY.md` and the README for the threat model, the OGSF alignment, and the API.
           files: |
             FluxNext.rbxl
             FluxNext.rbxl.sha256

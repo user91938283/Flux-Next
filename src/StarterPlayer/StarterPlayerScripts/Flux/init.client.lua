@@ -1,7 +1,7 @@
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
-local SEED_A = 2166136261
-local SEED_B = 4278190080
+local HASH_A = 2166136261
+local HASH_B = 4278190080
 local PRIME = 16777619
 local MODULUS = 4294967296
 
@@ -11,9 +11,10 @@ local function mul32(a, b)
 	return (low * b + (high * b % 65536) * 65536) % MODULUS
 end
 
-local function token(key, counter, name)
-	local data = key .. ":" .. tostring(counter) .. ":" .. name
-	local a, b = SEED_A, SEED_B
+-- Non-cryptographic checksum for envelope hygiene, not a MAC.
+local function checksum(salt, counter, name)
+	local data = salt .. ":" .. tostring(counter) .. ":" .. name
+	local a, b = HASH_A, HASH_B
 	for i = 1, #data do
 		local byte = string.byte(data, i)
 		a = mul32(bit32.bxor(a, byte), PRIME)
@@ -22,25 +23,25 @@ local function token(key, counter, name)
 	return string.format("%08x%08x", a, b)
 end
 
-local function deriveKeys(master)
+local function deriveSalts(seed)
 	return {
-		event = token(master, "key", "event"),
-		["function"] = token(master, "key", "function"),
+		event = checksum(seed, "salt", "event"),
+		["function"] = checksum(seed, "salt", "function"),
 	}
 end
 
 local eventHandlers = {}
 local counters = { event = 0, ["function"] = 0 }
-local keys
+local salts
 local epoch = -1
 local event, func
 local ready = Instance.new("BindableEvent")
 local settled = false
 
-local function apply(master, version)
+local function apply(seed, version)
 	version = tonumber(version) or 0
-	if version > epoch and type(master) == "string" and #master == 64 then
-		keys = deriveKeys(master)
+	if version > epoch and type(seed) == "string" and #seed == 64 then
+		salts = deriveSalts(seed)
 		epoch = version
 	end
 end
@@ -61,9 +62,9 @@ task.spawn(function()
 		end
 	end)
 
-	local ok, master, version = pcall(handshake.InvokeServer, handshake)
+	local ok, seed, version = pcall(handshake.InvokeServer, handshake)
 	if ok then
-		apply(master, version)
+		apply(seed, version)
 	end
 	settled = true
 	ready:Fire()
@@ -73,15 +74,15 @@ local function awaitReady()
 	if not settled then
 		ready.Event:Wait()
 	end
-	if not keys then
+	if not salts then
 		error("Flux: handshake failed")
 	end
 end
 
-local function nextToken(kind, name)
+local function nextChecksum(kind, name)
 	local counter = counters[kind] + 1
 	counters[kind] = counter
-	return counter, token(keys[kind], counter, name)
+	return counter, checksum(salts[kind], counter, name)
 end
 
 local network = {}
@@ -95,14 +96,14 @@ end
 
 function network.fire(_, name, ...)
 	awaitReady()
-	local counter, proof = nextToken("event", name)
-	event:FireServer(counter, proof, name, ...)
+	local counter, digest = nextChecksum("event", name)
+	event:FireServer(counter, digest, name, ...)
 end
 
 function network.invoke(_, name, ...)
 	awaitReady()
-	local counter, proof = nextToken("function", name)
-	return func:InvokeServer(counter, proof, name, ...)
+	local counter, digest = nextChecksum("function", name)
+	return func:InvokeServer(counter, digest, name, ...)
 end
 
 local packageCache = {}

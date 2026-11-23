@@ -44,7 +44,7 @@ rojo build -o FluxNext.rbxl
 
 or run `rojo serve default.project.json` and connect from Studio.
 
-Tagged releases include a prebuilt `FluxNext.rbxl` and `FluxNext.rbxl.sha256` on the repository's Releases page. Pushing a tag such as `v0.3.0` runs the release workflow.
+Tagged releases include a prebuilt `FluxNext.rbxl` and `FluxNext.rbxl.sha256` on the repository's Releases page. Pushing a tag such as `v0.3.1` runs the release workflow.
 
 In the source tree, `init.server.lua` and `init.client.lua` are Rojo's way to create a script with children:
 
@@ -129,7 +129,7 @@ end
 
 - `Flux.import(...)` — import built-in packages by name. `Flux.import("network")` returns the network link. Multiple names return multiple values.
 - `Flux.require(name)` — require a module from the entry script or `Shared` using the recursive loader.
-- `Flux.validate(schema, handler, label?)` — server only. Wrap a handler with strict argument validation. Invalid input kicks the player and reports a violation.
+- `Flux.validate(schema, handler, label?)` — server only. Wrap a handler with strict argument validation. The schema must describe every positional argument; extra arguments are rejected. Invalid input kicks the player and reports a violation.
 - `Flux.validateLenient(schema, handler, label?)` — server only. Same validation, but drops invalid calls instead of kicking.
 - `Flux.check(rule, value)` — server only. Validate one value. Returns `true` or `false, reason`.
 - `Flux.secure(options, handler)` — server only. Validate arguments, run an authorization guard, then call the handler. See below.
@@ -163,7 +163,7 @@ network:on("shoot", function(player)
 end, { rate = { capacity = 10, window = 1 } })
 ```
 
-The default is 60 calls per second per action. The global backstop is 120 calls per second per player. Rate-limit violations and unknown action names are dropped and reported, not kicked. Forged tokens, malformed protocol fields, and oversized payloads kick.
+The default is 60 calls per second per action. The global backstop is 120 calls per second per player. Rate-limit violations and unknown action names are dropped and reported, not kicked. Invalid checksums, malformed protocol fields, and oversized payloads kick.
 
 ### Validation schema
 
@@ -189,7 +189,7 @@ Rules:
 - `check = function(value) return boolean end` for custom rules.
 - `name`: label used in error messages and violation reports.
 
-`Flux.validate` is argument shape checking, not authorization. It does not know whether this player owns the item, is near the shop, is alive, or has enough currency. Use `Flux.secure` or a guard for that.
+`Flux.validate` is argument shape checking, not authorization. It does not know whether this player owns the item, is near the shop, is alive, or has enough currency. Use `Flux.secure` or a guard for that. `Flux.secure` without a `guard` only validates the schema; it does not authorize the action.
 
 ```lua
 network:onCall("buy", Flux.secure({
@@ -209,7 +209,7 @@ network:onCall("buy", Flux.secure({
 end))
 ```
 
-A guard must return `true` to allow the call. Returning `false` or `nil` denies it. Returning `false, reason` records the reason. A guard that throws an error also denies the call. Denials are reported through `Flux.onViolation` and do not kick by default.
+A guard must return boolean `true` to allow the call. Returning `false` or `nil` denies it; any other value, including truthy values, also denies it. Returning `false, reason` records the reason. A guard that throws an error also denies the call. Denials are reported through `Flux.onViolation` and do not kick by default.
 
 `Flux.secure` options:
 
@@ -231,7 +231,7 @@ Flux.onViolation(function(player, action, reason)
 end)
 ```
 
-The handler is called through `pcall`; a broken logger cannot break the game. Do not log tokens, keys, or unrelated player data.
+The violation logger is called through `pcall`; a broken logger cannot break the game. The default logger escapes control characters and aggregates repeated reasons. Do not log seeds, salts, checksums, payloads, or unrelated player data.
 
 ### Payload limits
 
@@ -239,6 +239,7 @@ The network layer rejects payloads that exceed:
 
 - 32 arguments;
 - 4096 bytes per string;
+- 16384 bytes total across string arguments and string keys;
 - 256 table entries, counting keys and values;
 - 6 levels of table nesting;
 - any `NaN` or infinity.
@@ -247,24 +248,26 @@ These limits apply before validation. Paginate or chunk large data instead of ra
 
 ### Protocol behavior
 
-On join, the server issues a high-entropy master key, derives separate keys for events and functions, and discards the master. Every client-to-server message carries a counter and a digest bound to the event or function name. The server accepts out-of-order counters inside a 1000-step window and rejects reused counters. Keys rotate every 60 seconds; the previous key is accepted for 10 seconds for messages already in flight. An epoch prevents an older key from overriding a newer one.
+On handshake, the server generates a per-session seed and derives separate channel salts for events and functions. The seed is sent to the client; both sides derive the same salts. It is not a secret. Every client-to-server message carries a counter and a non-cryptographic checksum over the channel salt, counter, and action name. The checksum does not cover the arguments. The server accepts out-of-order counters inside a 1000-step window and rejects reused counters. Salts rotate every 60 seconds; the previous salts are accepted for 10 seconds for messages already in flight. A rotation epoch prevents an older salt from replacing a newer one on the client.
 
 A failed or rejected handshake does not leave the client waiting forever: the next `fire` or `invoke` raises `Flux: handshake failed`.
 
 ## Security
 
-The token layer is protocol hygiene, not a security boundary. It stops accidental malformed traffic and naive replay, but a cheater who controls the client can read the keys from memory, call the network link directly, and produce valid messages. The digest is an FNV-style lightweight function, not a cryptographic MAC. Do not describe it as encryption or authentication.
+The checksum layer is protocol hygiene, not a security boundary. It rejects malformed envelopes, counters outside the window, replayed counters, and checksum mismatches for the action name and counter. It does not detect argument tampering, because the arguments are not part of the checksum. A cheater who controls the client can read the seed, derive the salts, call the remotes directly, and produce valid checksums. The checksum is an FNV-style lightweight function, not a cryptographic MAC. Do not describe it as encryption, authentication, a signature, or a session token.
 
 The real boundary is server authority:
 
 - validate shape, type, range, length, and `Instance` class or ancestor with `Flux.validate` or `Flux.secure`;
 - authorize the action against server state: ownership, distance, cooldown, inventory, currency, alive state;
+- compare a client-supplied `Player` or `Instance` with the caller and check ownership, not just type or ancestry;
+- sanitize text before storing, displaying, or broadcasting it; validation is not sanitization;
 - never trust a client-provided price, reward, stat, cooldown, or success flag;
 - keep economy, drop rates, and rule constants in server-only code;
 - rate-limit expensive actions and chunk large payloads;
 - use `UserId` in logs, not player names.
 
-`ReplicatedStorage` and `Shared` are visible to clients. Server modules under `Flux/server` and `ServerStorage` are not. Removing `shared.import` on the client is only cleanup; it is not access control.
+`ReplicatedStorage` and `Shared` are visible to clients. Server modules under `Flux/server` and `ServerStorage` are not. Removing `shared.import` on the client is only cleanup; it is not access control. A `Player` or `Instance` sent by the client is a reference, not proof of ownership. Flux does not manage accounts or session tokens; Roblox's `Player` object is the only identity.
 
 Kicks are a response to protocol violations, not a security guarantee. A determined cheater can rejoin. The server must stay correct even when a client sends valid-looking messages.
 
@@ -290,7 +293,7 @@ python tests/build.py
 luau tests/.build/run.lua
 ```
 
-The build script embeds the real server, client, and package sources into one test bundle. The suite covers event/function separation, token binding, replay and counter windows, NaN and payload limits, rate limits, guards, `Instance` rules, handshake failure, rotation, the module loader, every package, and server/client package boundaries.
+The build script embeds the real server, client, and package sources into one test bundle. The suite covers event/function separation, checksum binding, replay and counter windows, NaN and payload limits, rate limits, guards, `Instance` rules, handshake failure, rotation, the module loader, every package, and server/client package boundaries.
 
 CI runs the tests, compiles every `.lua` file, and builds the place file. The release workflow repeats the checks before publishing.
 

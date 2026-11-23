@@ -40,8 +40,8 @@ local function test(name, callback)
 	end
 end
 
-local SEED_A = 2166136261
-local SEED_B = 4278190080
+local HASH_A = 2166136261
+local HASH_B = 4278190080
 local PRIME = 16777619
 local MODULUS = 4294967296
 
@@ -51,9 +51,9 @@ local function mul32(a, b)
 	return (low * b + (high * b % 65536) * 65536) % MODULUS
 end
 
-local function token(key, counter, name)
-	local data = key .. ":" .. tostring(counter) .. ":" .. name
-	local a, b = SEED_A, SEED_B
+local function checksum(salt, counter, name)
+	local data = salt .. ":" .. tostring(counter) .. ":" .. name
+	local a, b = HASH_A, HASH_B
 	for index = 1, #data do
 		local byte = string.byte(data, index)
 		a = mul32(bit32.bxor(a, byte), PRIME)
@@ -62,9 +62,9 @@ local function token(key, counter, name)
 	return string.format("%08x%08x", a, b)
 end
 
-local function proof(master, kind, counter, name)
-	local key = token(master, "key", kind)
-	return token(key, counter, name)
+local function checksumFor(seed, kind, counter, name)
+	local salt = checksum(seed, "salt", kind)
+	return checksum(salt, counter, name)
 end
 
 local function kicked(env)
@@ -158,7 +158,7 @@ test("function results preserve multiple returns", function()
 	assertEqual(third, 3)
 end)
 
-test("tokens are bound to the action name", function()
+test("checksums are bound to the action name", function()
 	local env = Mock.setup()
 	local calls = 0
 	env.server:on("alpha", function()
@@ -169,8 +169,8 @@ test("tokens are bound to the action name", function()
 	end)
 
 	local event = Mock.remote("Event")
-	event.OnServerEvent:Fire(env.player, 1, proof(env.master, "event", 1, "alpha"), "beta", 1)
-	assertMatch(kicked(env), "bad token")
+	event.OnServerEvent:Fire(env.player, 1, checksumFor(env.seed, "event", 1, "alpha"), "beta", 1)
+	assertMatch(kicked(env), "bad checksum")
 	assertEqual(calls, 0)
 
 	local control = Mock.setup()
@@ -181,7 +181,7 @@ test("tokens are bound to the action name", function()
 	Mock.remote("Event").OnServerEvent:Fire(
 		control.player,
 		1,
-		proof(control.master, "event", 1, "alpha"),
+		checksumFor(control.seed, "event", 1, "alpha"),
 		"alpha",
 		1
 	)
@@ -189,17 +189,17 @@ test("tokens are bound to the action name", function()
 	assertEqual(accepted, 1)
 end)
 
-test("event and function keys are separate", function()
+test("event and function salts are separate", function()
 	local env = Mock.setup()
 	env.server:on("eventOnly", function() end)
 	env.server:onCall("callOnly", function()
 		return true
 	end)
 
-	local eventProof = proof(env.master, "event", 1, "eventOnly")
-	local result = Mock.remote("Function"):InvokeServer(1, eventProof, "callOnly")
+	local eventChecksum = checksumFor(env.seed, "event", 1, "eventOnly")
+	local result = Mock.remote("Function"):InvokeServer(1, eventChecksum, "callOnly")
 	assertNil(result)
-	assertMatch(kicked(env), "bad token")
+	assertMatch(kicked(env), "bad checksum")
 end)
 
 test("replayed counters are rejected", function()
@@ -210,13 +210,13 @@ test("replayed counters are rejected", function()
 	end)
 
 	local event = Mock.remote("Event")
-	local eventProof = proof(env.master, "event", 1, "ping")
-	event.OnServerEvent:Fire(env.player, 1, eventProof, "ping")
+	local eventChecksum = checksumFor(env.seed, "event", 1, "ping")
+	event.OnServerEvent:Fire(env.player, 1, eventChecksum, "ping")
 	assertEqual(calls, 1)
 	assertNil(kicked(env))
 
-	event.OnServerEvent:Fire(env.player, 1, eventProof, "ping")
-	assertMatch(kicked(env), "replayed token")
+	event.OnServerEvent:Fire(env.player, 1, eventChecksum, "ping")
+	assertMatch(kicked(env), "replayed counter")
 	assertEqual(calls, 1)
 end)
 
@@ -228,8 +228,8 @@ test("counters may arrive out of order inside the window", function()
 	end)
 
 	local event = Mock.remote("Event")
-	event.OnServerEvent:Fire(env.player, 2, proof(env.master, "event", 2, "ping"), "ping", 10)
-	event.OnServerEvent:Fire(env.player, 1, proof(env.master, "event", 1, "ping"), "ping", 1)
+	event.OnServerEvent:Fire(env.player, 2, checksumFor(env.seed, "event", 2, "ping"), "ping", 10)
+	event.OnServerEvent:Fire(env.player, 1, checksumFor(env.seed, "event", 1, "ping"), "ping", 1)
 	assertNil(kicked(env))
 	assertEqual(total, 11)
 end)
@@ -240,27 +240,27 @@ test("counters outside the window are rejected", function()
 	Mock.remote("Event").OnServerEvent:Fire(
 		env.player,
 		1001,
-		proof(env.master, "event", 1001, "ping"),
+		checksumFor(env.seed, "event", 1001, "ping"),
 		"ping"
 	)
-	assertMatch(kicked(env), "stale token")
+	assertMatch(kicked(env), "stale counter")
 end)
 
 test("malformed protocol fields are rejected", function()
 	local cases = {
-		{ label = "counter type", counter = "1", eventProof = "deadbeefdeadbeef", name = "ping", pattern = "malformed token" },
-		{ label = "proof length", counter = 1, eventProof = "short", name = "ping", pattern = "malformed token" },
-		{ label = "fractional counter", counter = 1.5, eventProof = "deadbeefdeadbeef", name = "ping", pattern = "malformed token" },
-		{ label = "zero counter", counter = 0, eventProof = "deadbeefdeadbeef", name = "ping", pattern = "malformed token" },
-		{ label = "infinite counter", counter = math.huge, eventProof = "deadbeefdeadbeef", name = "ping", pattern = "malformed token" },
-		{ label = "long action name", counter = 1, eventProof = "deadbeefdeadbeef", name = string.rep("x", 129), pattern = "malformed action name" },
-		{ label = "empty action name", counter = 1, eventProof = "deadbeefdeadbeef", name = "", pattern = "malformed action name" },
+		{ label = "counter type", counter = "1", eventChecksum = "deadbeefdeadbeef", name = "ping", pattern = "malformed checksum" },
+		{ label = "checksum length", counter = 1, eventChecksum = "short", name = "ping", pattern = "malformed checksum" },
+		{ label = "fractional counter", counter = 1.5, eventChecksum = "deadbeefdeadbeef", name = "ping", pattern = "malformed checksum" },
+		{ label = "zero counter", counter = 0, eventChecksum = "deadbeefdeadbeef", name = "ping", pattern = "malformed checksum" },
+		{ label = "infinite counter", counter = math.huge, eventChecksum = "deadbeefdeadbeef", name = "ping", pattern = "malformed checksum" },
+		{ label = "long action name", counter = 1, eventChecksum = "deadbeefdeadbeef", name = string.rep("x", 129), pattern = "malformed action name" },
+		{ label = "empty action name", counter = 1, eventChecksum = "deadbeefdeadbeef", name = "", pattern = "malformed action name" },
 	}
 
 	for _, case in ipairs(cases) do
 		local env = Mock.setup()
 		env.server:on("ping", function() end)
-		Mock.remote("Event").OnServerEvent:Fire(env.player, case.counter, case.eventProof, case.name)
+		Mock.remote("Event").OnServerEvent:Fire(env.player, case.counter, case.eventChecksum, case.name)
 		assertMatch(kicked(env), case.pattern, case.label)
 	end
 end)
@@ -317,6 +317,14 @@ test("payload limits", function()
 		return math.huge - math.huge
 	end, "non-finite number")
 
+	payloadRejected("total string bytes", function()
+		local value = {}
+		for index = 1, 5 do
+			value[index] = string.rep("x", 4096)
+		end
+		return value
+	end, "payload too large")
+
 	local env = Mock.setup()
 	local calls = 0
 	env.server:on("data", function()
@@ -325,6 +333,19 @@ test("payload limits", function()
 	env.client:fire("data", string.rep("x", 4096))
 	assertNil(kicked(env))
 	assertEqual(calls, 1)
+
+	local atLimit = Mock.setup()
+	local atLimitCalls = 0
+	atLimit.server:on("data", function()
+		atLimitCalls += 1
+	end)
+	local strings = {}
+	for index = 1, 4 do
+		strings[index] = string.rep("x", 4096)
+	end
+	atLimit.client:fire("data", table.unpack(strings, 1, 4))
+	assertNil(kicked(atLimit))
+	assertEqual(atLimitCalls, 1)
 
 	local many = Mock.setup()
 	local manyCalls = 0
@@ -452,6 +473,20 @@ test("guards fail closed", function()
 	assertNil(kicked(denied))
 end)
 
+test("guards allow only boolean true", function()
+	local env = Mock.setup()
+	local calls = 0
+	env.server:onCall("guarded", env.flux.guard(function()
+		return "yes"
+	end, function()
+		calls += 1
+	end, "guarded"))
+	env.client:invoke("guarded")
+	assertEqual(calls, 0)
+	assertMatch(violationReason(), "authorization denied")
+	assertNil(kicked(env))
+end)
+
 test("secure validation can be strict", function()
 	local env = Mock.setup()
 	local calls = 0
@@ -569,6 +604,31 @@ test("strict and lenient validation", function()
 	assertMatch(violationReason(), "expected string")
 end)
 
+test("extra arguments are rejected", function()
+	local strict = Mock.setup()
+	local strictCalls = 0
+	strict.server:onCall("strictExtra", strict.flux.validate({
+		{ type = "string" },
+	}, function()
+		strictCalls += 1
+	end))
+	strict.client:invoke("strictExtra", "ok", "extra")
+	assertEqual(strictCalls, 0)
+	assertMatch(kicked(strict), "invalid argument count")
+
+	local lenient = Mock.setup()
+	local lenientCalls = 0
+	lenient.server:onCall("lenientExtra", lenient.flux.validateLenient({
+		{ type = "string" },
+	}, function()
+		lenientCalls += 1
+	end))
+	lenient.client:invoke("lenientExtra", "ok", "extra")
+	assertEqual(lenientCalls, 0)
+	assertNil(kicked(lenient))
+	assertMatch(violationReason(), "invalid argument count")
+end)
+
 test("registration rejects invalid handlers", function()
 	local env = Mock.setup()
 	local callback = function() end
@@ -597,6 +657,39 @@ test("violation handler errors are contained", function()
 	assertNil(kicked(env))
 	assertTrue(#Mock.warnings > 0)
 	assertMatch(Mock.warnings[#Mock.warnings], "violation handler failed")
+end)
+
+test("client action names are sanitized in logs", function()
+	local env = Mock.setup()
+	env.server:on("ping", function() end)
+	env.client:fire("bad\nFAKE\\NAME")
+	local violation = lastViolation()
+	assertTrue(violation ~= nil)
+	assertEqual(string.find(violation.action, "\n", 1, true), nil)
+	assertMatch(violation.action, "\\x0a")
+	assertMatch(violation.action, "\\\\")
+end)
+
+test("default violation logger aggregates repeated reasons", function()
+	local env = Mock.setup()
+	env.flux.onViolation(nil)
+	env.server:on("ping", function() end)
+
+	for index = 1, 5 do
+		env.client:fire("missing" .. index)
+	end
+
+	local count = 0
+	for _, warning in ipairs(Mock.warnings) do
+		if string.find(warning, "unknown event", 1, true) then
+			count += 1
+		end
+	end
+	assertEqual(count, 1)
+
+	Mock.advance(1)
+	env.client:fire("missing6")
+	assertMatch(Mock.warnings[#Mock.warnings], "4 similar suppressed")
 end)
 
 test("handshake failure raises instead of hanging", function()
@@ -630,14 +723,14 @@ test("removed player sessions are closed", function()
 	Mock.remote("Event").OnServerEvent:Fire(
 		env.player,
 		1,
-		proof(env.master, "event", 1, "ping"),
+		checksumFor(env.seed, "event", 1, "ping"),
 		"ping"
 	)
 	assertNil(kicked(env))
 	assertMatch(violationReason(), "no session")
 end)
 
-test("key rotation keeps traffic working", function()
+test("salt rotation keeps traffic working", function()
 	local env = Mock.setup()
 	local legacy = nil
 	env.server:onCall("echo", function(player, value)
@@ -653,20 +746,20 @@ test("key rotation keeps traffic working", function()
 	Mock.advance(60)
 	Mock.advance(0)
 	assertTrue(rotate.lastArgs ~= nil)
-	local nextMaster = rotate.lastArgs[1]
+	local nextSeed = rotate.lastArgs[1]
 	local nextEpoch = rotate.lastArgs[2]
-	assertTrue(nextMaster ~= env.master)
+	assertTrue(nextSeed ~= env.seed)
 	assertEqual(nextEpoch, 1)
 	assertEqual(env.client:invoke("echo", 2), 2)
 
-	rotate:FireClient(env.player, env.master, 0)
+	rotate:FireClient(env.player, env.seed, 0)
 	assertEqual(env.client:invoke("echo", 3), 3)
 
 	Mock.advance(5)
 	Mock.remote("Event").OnServerEvent:Fire(
 		env.player,
 		1,
-		proof(env.master, "event", 1, "legacy"),
+		checksumFor(env.seed, "event", 1, "legacy"),
 		"legacy",
 		9
 	)
@@ -677,11 +770,11 @@ test("key rotation keeps traffic working", function()
 	Mock.remote("Event").OnServerEvent:Fire(
 		env.player,
 		2,
-		proof(env.master, "event", 2, "legacy"),
+		checksumFor(env.seed, "event", 2, "legacy"),
 		"legacy",
 		10
 	)
-	assertMatch(kicked(env), "bad token")
+	assertMatch(kicked(env), "bad checksum")
 end)
 
 test("client clears shared handles", function()

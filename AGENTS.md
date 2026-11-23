@@ -5,14 +5,18 @@ Instructions for AI coding assistants working on Flux-Next. This file follows th
 ## Non-negotiable rules
 
 - The server is authoritative. Never move a gameplay decision, reward, price, cooldown, drop rate, or success check to the client.
-- Treat every remote payload as hostile. Validate shape, type, range, length, and `Instance` class or ancestor on the server.
+- Treat every remote payload as hostile. Validate shape, type, range, length, and `Instance` class or ancestor on the server. Reject extra positional arguments; a schema must cover every argument.
 - Validation is not authorization. Check ownership, distance, inventory, currency, cooldown, and alive state in a guard before mutating server state.
+- A client-supplied `Player` or `Instance` is a reference, not proof of ownership. Compare it with the caller and check ownership.
 - Never put secrets, server-only rules, or anti-cheat parameters in `ReplicatedStorage`, `Shared`, `Packages`, or `["Flux/client"]`.
-- Do not rely on tokens, key rotation, `shared.import = nil`, client-side hiding, or kicks as a security boundary.
+- Do not rely on the session seed, checksums, salt rotation, `shared.import = nil`, client-side hiding, or kicks as a security boundary.
+- Call the client-known value a session seed and the digest a checksum. Never describe them as keys, tokens, MACs, or signatures.
+- Do not add cryptography to make the checksum layer look stronger; the client receives the seed.
 - Do not add server-to-client `InvokeClient`. Use events for server-to-client messages and client-to-server functions only for request/response calls that need a return value.
 - Keep event and function handlers separate. Do not merge `network:on` and `network:onCall`.
-- Rate-limit expensive actions. Drop and report rate-limit and unknown-action violations. Kick only for protocol violations such as a forged token, malformed fields, or an oversized payload.
-- Log with `UserId`, the action, and the reason. Never log tokens, keys, or unrelated player data.
+- Rate-limit expensive actions. Drop and report rate-limit and unknown-action violations. Kick only for protocol violations such as a bad checksum, malformed fields, or an oversized payload.
+- Log with `UserId`, the action, and the reason. Never log seeds, salts, checksums, payloads, or unrelated player data.
+- Sanitize client-controlled strings before logging and throttle repeated violation logs.
 
 ## Layout
 
@@ -34,7 +38,7 @@ Instructions for AI coding assistants working on Flux-Next. This file follows th
 
 ## Security-sensitive changes
 
-When changing the network layer, validation, rate limits, payload limits, key rotation, or authorization helpers:
+When changing the network layer, validation, rate limits, payload limits, salt rotation, or authorization helpers:
 
 - update `README.md` and `SECURITY.md` when behavior or guarantees change;
 - add or update tests under `tests/`;
@@ -64,5 +68,5 @@ Compile every `.lua` file with `luau-compile`, then build the place file with Ro
 ## Documentation
 
 - Update the API section when a public function or argument changes.
-- Explain limitations honestly. Do not describe the token layer as encryption, authentication, or a cryptographic MAC.
+- Explain limitations honestly. Do not describe the checksum layer as encryption, authentication, a session token, or a cryptographic MAC.
 - Include server-authority examples, not client-side security examples.

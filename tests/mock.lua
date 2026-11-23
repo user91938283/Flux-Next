@@ -383,7 +383,7 @@ function Mock.setup()
 		client = client,
 		clientFlux = clientFlux,
 		player = Mock.player,
-		master = handshake.lastResult[1],
+		seed = handshake.lastResult[1],
 	}
 end
 

@@ -4,7 +4,7 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RATE_LIMIT = 120
 local DEFAULT_RATE_CAPACITY = 60
 local DEFAULT_RATE_WINDOW = 1
-local TOKEN_WINDOW = 1000
+local COUNTER_WINDOW = 1000
 local ROTATE_INTERVAL = 60
 local ROTATE_GRACE = 10
 local MAX_NAME = 128
@@ -12,9 +12,11 @@ local MAX_ARGS = 32
 local MAX_STRING_BYTES = 4096
 local MAX_TABLE_ENTRIES = 256
 local MAX_TABLE_DEPTH = 6
+local MAX_PAYLOAD_BYTES = 16384
+local MAX_LOG_REASON = 256
 
-local SEED_A = 2166136261
-local SEED_B = 4278190080
+local HASH_A = 2166136261
+local HASH_B = 4278190080
 local PRIME = 16777619
 local MODULUS = 4294967296
 
@@ -24,9 +26,10 @@ local function mul32(a, b)
 	return (low * b + (high * b % 65536) * 65536) % MODULUS
 end
 
-local function token(key, counter, name)
-	local data = key .. ":" .. tostring(counter) .. ":" .. name
-	local a, b = SEED_A, SEED_B
+-- Non-cryptographic checksum for envelope hygiene, not a MAC.
+local function checksum(salt, counter, name)
+	local data = salt .. ":" .. tostring(counter) .. ":" .. name
+	local a, b = HASH_A, HASH_B
 	for i = 1, #data do
 		local byte = string.byte(data, i)
 		a = mul32(bit32.bxor(a, byte), PRIME)
@@ -35,19 +38,20 @@ local function token(key, counter, name)
 	return string.format("%08x%08x", a, b)
 end
 
-local function generateKey()
+-- The client receives this seed. It is a nonce for request checksums, not a secret.
+local function newSessionSeed()
 	local rng = Random.new()
-	local key = ""
+	local seed = ""
 	for _ = 1, 32 do
-		key ..= string.format("%02x", rng:NextInteger(0, 255))
+		seed ..= string.format("%02x", rng:NextInteger(0, 255))
 	end
-	return key
+	return seed
 end
 
-local function deriveKeys(master)
+local function deriveSalts(seed)
 	return {
-		event = token(master, "key", "event"),
-		["function"] = token(master, "key", "function"),
+		event = checksum(seed, "salt", "event"),
+		["function"] = checksum(seed, "salt", "function"),
 	}
 end
 
@@ -75,7 +79,46 @@ local sessions = {}
 local eventHandlers = {}
 local functionHandlers = {}
 
+local LOG_ESCAPES = {}
+for byte = 0, 31 do
+	LOG_ESCAPES[string.char(byte)] = string.format("\\x%02x", byte)
+end
+LOG_ESCAPES["\127"] = "\\x7f"
+LOG_ESCAPES["\\"] = "\\\\"
+
+local function sanitizeLogValue(value, limit)
+	local text = string.gsub(tostring(value), "[%c\\]", LOG_ESCAPES)
+	if #text > limit then
+		text = string.sub(text, 1, limit) .. "..."
+	end
+	return text
+end
+
+local defaultLog = {}
+
 local function defaultViolation(player, action, reason)
+	if player then
+		local state = defaultLog[player]
+		if not state then
+			state = {}
+			defaultLog[player] = state
+		end
+		local now = os.clock()
+		local entry = state[reason]
+		if not entry then
+			entry = { at = now, suppressed = 0 }
+			state[reason] = entry
+		elseif now - entry.at < 1 then
+			entry.suppressed += 1
+			return
+		end
+		local suppressed = entry.suppressed
+		entry.at = now
+		entry.suppressed = 0
+		if suppressed > 0 then
+			reason = reason .. " (" .. suppressed .. " similar suppressed)"
+		end
+	end
 	warn(string.format(
 		"Flux: %s from %s: %s",
 		tostring(action),
@@ -87,6 +130,8 @@ end
 local violationHandler = defaultViolation
 
 local function reportViolation(player, action, reason)
+	action = sanitizeLogValue(action, MAX_NAME)
+	reason = sanitizeLogValue(reason, MAX_LOG_REASON)
 	local ok, err = pcall(violationHandler, player, action, reason)
 	if not ok then
 		warn("Flux: violation handler failed: " .. tostring(err))
@@ -141,12 +186,12 @@ local function rotateLater(player, session)
 		if sessions[player] ~= session then
 			return
 		end
-		local master = generateKey()
-		session.previous = session.keys
-		session.keys = deriveKeys(master)
+		local seed = newSessionSeed()
+		session.previousSalts = session.salts
+		session.salts = deriveSalts(seed)
 		session.graceUntil = os.clock() + ROTATE_GRACE
 		session.epoch += 1
-		if not pcall(rotate.FireClient, rotate, player, master, session.epoch) then
+		if not pcall(rotate.FireClient, rotate, player, seed, session.epoch) then
 			sessions[player] = nil
 			return
 		end
@@ -154,32 +199,32 @@ local function rotateLater(player, session)
 	end)
 end
 
-local function validateToken(session, kind, counter, proof, name)
+local function validateChecksum(session, kind, counter, digest, name)
 	if type(counter) ~= "number" or not math.isfinite(counter) or counter % 1 ~= 0 or counter < 1 then
-		return false, "malformed token"
+		return false, "malformed checksum"
 	end
-	if type(proof) ~= "string" or #proof ~= 16 then
-		return false, "malformed token"
+	if type(digest) ~= "string" or #digest ~= 16 then
+		return false, "malformed checksum"
 	end
 	local last = session.counters[kind]
-	if counter <= last - TOKEN_WINDOW or counter > last + TOKEN_WINDOW then
-		return false, "stale token"
+	if counter <= last - COUNTER_WINDOW or counter > last + COUNTER_WINDOW then
+		return false, "stale counter"
 	end
 	local seen = session.seen[kind]
 	if seen[counter] then
-		return false, "replayed token"
+		return false, "replayed counter"
 	end
-	local ok = proof == token(session.keys[kind], counter, name)
+	local ok = digest == checksum(session.salts[kind], counter, name)
 	if not ok then
-		local previous = session.previous
-		if not previous or os.clock() > session.graceUntil or proof ~= token(previous[kind], counter, name) then
-			return false, "bad token"
+		local previous = session.previousSalts
+		if not previous or os.clock() > session.graceUntil or digest ~= checksum(previous[kind], counter, name) then
+			return false, "bad checksum"
 		end
 	end
 	seen[counter] = true
 	if counter > last then
 		session.counters[kind] = counter
-		local lower = counter - TOKEN_WINDOW
+		local lower = counter - COUNTER_WINDOW
 		for value in pairs(seen) do
 			if value <= lower then
 				seen[value] = nil
@@ -194,6 +239,10 @@ local function checkPayload(value, depth, budget, visited)
 	if valueType == "string" then
 		if #value > MAX_STRING_BYTES then
 			return false, "string too long"
+		end
+		budget.bytes += #value
+		if budget.bytes > MAX_PAYLOAD_BYTES then
+			return false, "payload too large"
 		end
 	elseif valueType == "number" then
 		if not math.isfinite(value) then
@@ -229,7 +278,7 @@ local function checkPayloadArgs(...)
 	if select("#", ...) > MAX_ARGS then
 		return false, "too many arguments"
 	end
-	local budget = { entries = 0 }
+	local budget = { entries = 0, bytes = 0 }
 	local visited = {}
 	for i = 1, select("#", ...) do
 		local ok, reason = checkPayload(select(i, ...), 1, budget, visited)
@@ -240,7 +289,7 @@ local function checkPayloadArgs(...)
 	return true
 end
 
-local function handleCall(kind, player, counter, proof, name, ...)
+local function handleCall(kind, player, counter, digest, name, ...)
 	local session = sessions[player]
 	if not session then
 		drop(player, kind, "no session")
@@ -264,9 +313,9 @@ local function handleCall(kind, player, counter, proof, name, ...)
 		drop(player, name, "unknown " .. kind)
 		return
 	end
-	local ok, reason = validateToken(session, kind, counter, proof, name)
+	local ok, reason = validateChecksum(session, kind, counter, digest, name)
 	if not ok then
-		reject(player, "token", reason)
+		reject(player, "checksum", reason)
 		return
 	end
 	local payloadOk, payloadReason = checkPayloadArgs(...)
@@ -286,9 +335,9 @@ handshake.OnServerInvoke = function(player)
 		reject(player, "handshake", "duplicate handshake")
 		return
 	end
-	local master = generateKey()
+	local seed = newSessionSeed()
 	local session = {
-		keys = deriveKeys(master),
+		salts = deriveSalts(seed),
 		counters = { event = 0, ["function"] = 0 },
 		seen = { event = {}, ["function"] = {} },
 		actions = {},
@@ -300,19 +349,20 @@ handshake.OnServerInvoke = function(player)
 	}
 	sessions[player] = session
 	rotateLater(player, session)
-	return master, session.epoch
+	return seed, session.epoch
 end
 
-event.OnServerEvent:Connect(function(player, counter, proof, name, ...)
-	handleCall("event", player, counter, proof, name, ...)
+event.OnServerEvent:Connect(function(player, counter, digest, name, ...)
+	handleCall("event", player, counter, digest, name, ...)
 end)
 
-func.OnServerInvoke = function(player, counter, proof, name, ...)
-	return handleCall("function", player, counter, proof, name, ...)
+func.OnServerInvoke = function(player, counter, digest, name, ...)
+	return handleCall("function", player, counter, digest, name, ...)
 end
 
 Players.PlayerRemoving:Connect(function(player)
 	sessions[player] = nil
+	defaultLog[player] = nil
 end)
 
 local network = {}
@@ -433,6 +483,16 @@ local function check(rule, value)
 end
 
 local function validateCall(player, schema, label, strict, ...)
+	local count = select("#", ...)
+	if count > #schema then
+		local message = "invalid argument count (expected at most " .. #schema .. ", got " .. count .. ")"
+		if strict then
+			reject(player, label, message)
+		else
+			reportViolation(player, label, message)
+		end
+		return false
+	end
 	for i, rule in ipairs(schema) do
 		local ok, reason = check(rule, select(i, ...))
 		if not ok then
@@ -493,7 +553,7 @@ local function secure(options, handler)
 				reportViolation(player, label, "guard failed: " .. tostring(result[2]))
 				return
 			end
-			if not result[2] then
+			if result[2] ~= true then
 				reportViolation(player, label, tostring(result[3] or "authorization denied"))
 				return
 			end
