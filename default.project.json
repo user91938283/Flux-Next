@@ -1,0 +1,26 @@
+{
+  "name": "FluxNext",
+  "tree": {
+    "$className": "DataModel",
+    "ReplicatedStorage": {
+      "Packages": {
+        "$path": "src/ReplicatedStorage/Packages"
+      },
+      "Shared": {
+        "$path": "src/ReplicatedStorage/Shared"
+      }
+    },
+    "ServerScriptService": {
+      "Flux/server": {
+        "$path": "src/ServerScriptService/Flux"
+      }
+    },
+    "StarterPlayer": {
+      "StarterPlayerScripts": {
+        "Flux/client": {
+          "$path": "src/StarterPlayer/StarterPlayerScripts/Flux"
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,76 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Install Luau
+        run: |
+          curl -fsSL -o luau.zip https://github.com/luau-lang/luau/releases/download/0.748/luau-ubuntu.zip
+          echo "e6905c04dbccaeff54ca4986b0017f125db5aa301bcb34d0446355cbfee5bc83  luau.zip" | sha256sum -c -
+          unzip -q luau.zip -d "$RUNNER_TEMP/luau"
+          chmod +x "$RUNNER_TEMP"/luau/*
+          echo "$RUNNER_TEMP/luau" >> "$GITHUB_PATH"
+
+      - name: Compile sources
+        run: |
+          status=0
+          while IFS= read -r -d '' file; do
+            luau-compile --binary "$file" > /dev/null || status=1
+          done < <(find src tests -name '*.lua' -not -path 'tests/.build/*' -print0)
+          exit "$status"
+
+      - name: Run tests
+        run: |
+          python3 tests/build.py
+          luau tests/.build/run.lua
+
+      - name: Install Rojo
+        run: |
+          curl -fsSL -o rojo.zip https://github.com/rojo-rbx/rojo/releases/download/v7.7.1/rojo-7.7.1-linux-x86_64.zip
+          echo "00FEB4FA0829A1DD72B49DF2639DA519A352BFE13CADCD83969E2BA2BB5693C4  rojo.zip" | sha256sum -c -
+          unzip -q rojo.zip -d "$RUNNER_TEMP/rojo"
+          chmod +x "$RUNNER_TEMP/rojo/rojo"
+          echo "$RUNNER_TEMP/rojo" >> "$GITHUB_PATH"
+
+      - name: Build place file
+        run: |
+          rojo build default.project.json --output FluxNext.rbxl
+          sha256sum FluxNext.rbxl > FluxNext.rbxl.sha256
+
+      - name: Publish release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          name: Flux Next ${{ github.ref_name }}
+          body: |
+            Ready-to-open place file for Flux Next ${{ github.ref_name }}.
+
+            Assets:
+            - `FluxNext.rbxl` — open this in Roblox Studio.
+            - `FluxNext.rbxl.sha256` — verify with `sha256sum -c FluxNext.rbxl.sha256`.
+
+            Included:
+            - `Flux/server` Script and `Flux/client` LocalScript with `Core`, `Classes`, and `Handlers` children
+            - server-side validation, authorization helpers, rate limits, payload limits, and violation reporting
+            - rolling network keys, replay protection, and separate event and function channels
+            - packages and the module loader, independently implemented for v0.3.0
+            - source layout for Rojo in the repository
+
+            Flux Next v0.3.0 replaces the earlier package implementations. Releases before v0.3.0 were removed from this repository; see `THIRD_PARTY_NOTICES.md`.
+
+            The token layer is protocol hygiene, not an anti-cheat boundary. Keep gameplay decisions on the server. See `SECURITY.md` and the README for the threat model and API.
+          files: |
+            FluxNext.rbxl
+            FluxNext.rbxl.sha256
+          fail_on_unmatched_files: true
